@@ -1,7 +1,7 @@
 package Data::Reservoir::Shared;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 require XSLoader;
 XSLoader::load('Data::Reservoir::Shared', $VERSION);
 
@@ -31,6 +31,10 @@ Data::Reservoir::Shared - shared-memory reservoir sampler (uniform stream sample
     # share the reservoir across processes via a backing file
     my $shared = Data::Reservoir::Shared->new("/tmp/sample.rsv", 100);
 
+    # weighted sampling: keep items with probability proportional to weight
+    my $wrsv = Data::Reservoir::Shared->new_weighted(undef, 100);
+    $wrsv->add($event, $weight) for @stream;   # heavier items kept more often
+
 =head1 DESCRIPTION
 
 A B<reservoir sampler> in shared memory: it keeps a B<uniform random sample of
@@ -57,6 +61,21 @@ by their B<byte> content; wide-character strings (any codepoint above 255) cause
 a "Wide character" croak -- encode to bytes first. B<Linux-only>. Requires 64-bit
 Perl.
 
+=head2 Weighted sampling (A-Res)
+
+A reservoir created with C<new_weighted> keeps a B<weighted> random sample: each
+item carries a positive weight and is retained with probability proportional to
+its weight rather than uniformly. This is the B<Efraimidis-Spirakis A-Res>
+algorithm -- each observed item is assigned a key C<u ** (1/weight)> (with C<u>
+uniform in C<(0,1]>) and the C<k> items with the largest keys are kept, tracked
+in a shared min-heap so a heavier arrival can evict the current lightest member.
+With a single slot the probability of keeping item C<i> is exactly
+C<< w_i / sum(w) >>. Feed weighted items with C<< $rsv->add($item, $weight) >> (the
+weight must be a finite number greater than zero); everything else -- C<sample>,
+C<count>, C<get>, C<clear>, and cross-process sharing -- works identically. A
+weighted reservoir stores an extra C<k * 16> bytes for the heap and records its
+mode in the header, so a reopened segment stays weighted.
+
 =head1 METHODS
 
 =head2 Constructors
@@ -65,6 +84,10 @@ Perl.
     my $rsv = Data::Reservoir::Shared->new(undef, $k);              # anonymous, item_size 256
     my $rsv = Data::Reservoir::Shared->new_memfd($name, $k, $item_size);
     my $rsv = Data::Reservoir::Shared->new_from_fd($fd);
+
+    # weighted (A-Res) reservoir -- same arguments, weighted sampling
+    my $rsv = Data::Reservoir::Shared->new_weighted($path, $k, $item_size);
+    my $rsv = Data::Reservoir::Shared->new_weighted_memfd($name, $k, $item_size);
 
 C<$k> is the reservoir size (the number of items to retain, at least 1).
 C<$item_size> is the maximum bytes stored per item (default 256; items are
@@ -76,18 +99,23 @@ sharing; it defaults to C<0600> (owner-only).
 
 =head2 Sampling
 
-    my $kept  = $rsv->add($item);        # 1 if the item is now in the reservoir, 0 if discarded
-    my $n     = $rsv->add_many(\@items);  # number of the batch that ended up retained
+    my $kept  = $rsv->add($item);            # uniform: 1 if now stored, 0 if discarded
+    my $kept  = $rsv->add($item, $weight);    # weighted reservoir: weight must be > 0
+    my $n     = $rsv->add_many(\@items);              # uniform: array ref of items
+    my $n     = $rsv->add_many([[$item,$w], ...]);     # weighted: [item, weight] pairs
     my @items = $rsv->sample;            # current sample (a list, up to k items)
     my $it    = $rsv->get($i);           # the i-th retained item (0-based), or undef
     $rsv->clear;                         # empty the reservoir (seen resets to 0)
 
 C<add> feeds one item and returns B<1 if it is now stored> in the reservoir or
-B<0 if it was discarded>. C<add_many> feeds an array reference under a single
-write lock, returning how many of the batch are currently retained. C<sample>
-returns the retained items as a list (order is not meaningful); C<get> returns a
-single retained item by index. C<clear> empties the reservoir and resets the seen
-counter.
+B<0 if it was discarded>. On a B<weighted> reservoir C<add> takes a second
+argument, the item's weight (a finite number greater than zero -- a missing,
+zero, negative, infinite, or NaN weight croaks). C<add_many> feeds an array
+reference under a single write lock, returning how many of the batch are
+currently retained; for a weighted reservoir each element must be an
+C<< [$item, $weight] >> pair. C<sample> returns the retained items as a list
+(order is not meaningful); C<get> returns a single retained item by index.
+C<clear> empties the reservoir and resets the seen counter.
 
 =head2 Introspection and RNG
 
@@ -95,8 +123,9 @@ counter.
     $rsv->seen;         # total items observed
     $rsv->capacity;     # k
     $rsv->item_size;    # max bytes per item
+    $rsv->is_weighted;  # true for a weighted (A-Res) reservoir
     $rsv->seed($n);     # set the RNG state (for reproducible sampling in tests)
-    $rsv->stats;        # { size, item_size, count, seen, ops, mmap_size }
+    $rsv->stats;        # { size, item_size, count, seen, ops, mmap_size, weighted }
 
 C<seed> sets the shared RNG state to a fixed value, making subsequent sampling
 deterministic -- useful for reproducible tests. By default the RNG is seeded from

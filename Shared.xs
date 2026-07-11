@@ -34,7 +34,7 @@ new(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
     if (k < 1) croak("Data::Reservoir::Shared->new: reservoir size (k) must be >= 1");
     /* Optional 5th arg: file mode for a newly-created file-backed segment. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
-    RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, mode, errbuf);
+    RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, mode, errbuf);
     if (!hh) croak("Data::Reservoir::Shared->new: %s", errbuf);
     MAKE_OBJ(class, hh);
   OUTPUT:
@@ -51,8 +51,44 @@ new_memfd(class, name = &PL_sv_undef, k = 0, item_size = 256)
   CODE:
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
     if (k < 1) croak("Data::Reservoir::Shared->new_memfd: reservoir size (k) must be >= 1");
-    RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, errbuf);
+    RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, errbuf);
     if (!hh) croak("Data::Reservoir::Shared->new_memfd: %s", errbuf);
+    MAKE_OBJ(class, hh);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_weighted(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
+    const char *class
+    SV *path
+    UV k
+    UV item_size
+  PREINIT:
+    char errbuf[RSV_ERR_BUFLEN];
+  CODE:
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    if (k < 1) croak("Data::Reservoir::Shared->new_weighted: reservoir size (k) must be >= 1");
+    /* Optional 5th arg: file mode for a newly-created file-backed segment. */
+    mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
+    RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, RSV_MODE_WEIGHTED, mode, errbuf);
+    if (!hh) croak("Data::Reservoir::Shared->new_weighted: %s", errbuf);
+    MAKE_OBJ(class, hh);
+  OUTPUT:
+    RETVAL
+
+SV *
+new_weighted_memfd(class, name = &PL_sv_undef, k = 0, item_size = 256)
+    const char *class
+    SV *name
+    UV k
+    UV item_size
+  PREINIT:
+    char errbuf[RSV_ERR_BUFLEN];
+  CODE:
+    const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
+    if (k < 1) croak("Data::Reservoir::Shared->new_weighted_memfd: reservoir size (k) must be >= 1");
+    RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, RSV_MODE_WEIGHTED, errbuf);
+    if (!hh) croak("Data::Reservoir::Shared->new_weighted_memfd: %s", errbuf);
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -80,17 +116,29 @@ DESTROY(self)
     }
 
 int
-add(self, item)
+add(self, item, weight = &PL_sv_undef)
     SV *self
     SV *item
+    SV *weight
   PREINIT:
     EXTRACT(self);
     STRLEN n;
     const char *s;
+    double w = 0;
   CODE:
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
+    if (h->mode == RSV_MODE_WEIGHTED) {
+        /* resolve + validate the weight BEFORE taking the lock (no croak under lock) */
+        if (!(SvGETMAGIC(weight), SvOK(weight)))
+            croak("Data::Reservoir::Shared: weighted add(item, weight) requires a weight");
+        w = SvNV(weight);
+        if (!(w > 0.0) || !isfinite(w))
+            croak("Data::Reservoir::Shared: weight must be a finite number > 0");
+    }
     rsv_rwlock_wrlock(h);
-    RETVAL = rsv_add_locked(h, s, (uint64_t)n);
+    RETVAL = (h->mode == RSV_MODE_WEIGHTED)
+        ? rsv_add_weighted_locked(h, s, (uint64_t)n, w)
+        : rsv_add_locked(h, s, (uint64_t)n);
     __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
     rsv_rwlock_wrunlock(h);
   OUTPUT:
@@ -112,18 +160,40 @@ add_many(self, items)
     top = av_len(av);
     {
         STRLEN cnt = (top >= 0) ? (STRLEN)(top + 1) : 0, i;
-        const char **ps = NULL; STRLEN *ls = NULL;
+        const char **ps = NULL; STRLEN *ls = NULL; double *ws = NULL;
+        int weighted = (h->mode == RSV_MODE_WEIGHTED);
         if (cnt) {
             Newx(ps, cnt, const char *); SAVEFREEPV(ps);
             Newx(ls, cnt, STRLEN);       SAVEFREEPV(ls);
+            if (weighted) { Newx(ws, cnt, double); SAVEFREEPV(ws); }
             for (i = 0; i < cnt; i++) {
                 SV **el = av_fetch(av, (SSize_t)i, 0);
-                if (el && *el) ps[i] = SvPVbyte(*el, ls[i]);
-                else { ps[i] = ""; ls[i] = 0; }
+                if (weighted) {
+                    /* weighted mode: each element is a [item, weight] pair,
+                     * validated here (before the lock; no croak while locked) */
+                    if (!el || !*el || !SvROK(*el) || SvTYPE(SvRV(*el)) != SVt_PVAV)
+                        croak("Data::Reservoir::Shared->add_many: weighted reservoir expects [item, weight] pairs");
+                    AV *pair = (AV *)SvRV(*el);
+                    SV **iv = av_fetch(pair, 0, 0);
+                    SV **wv = av_fetch(pair, 1, 0);
+                    if (!iv || !*iv || !wv || !*wv)
+                        croak("Data::Reservoir::Shared->add_many: each element must be [item, weight]");
+                    ps[i] = SvPVbyte(*iv, ls[i]);
+                    SvGETMAGIC(*wv);
+                    { double w = SvNV(*wv);
+                      if (!(w > 0.0) || !isfinite(w))
+                          croak("Data::Reservoir::Shared->add_many: weight must be a finite number > 0");
+                      ws[i] = w; }
+                } else if (el && *el) {
+                    ps[i] = SvPVbyte(*el, ls[i]);
+                } else { ps[i] = ""; ls[i] = 0; }
             }
         }
         rsv_rwlock_wrlock(h);
-        for (i = 0; i < cnt; i++) stored += (UV)rsv_add_locked(h, ps[i], (uint64_t)ls[i]);
+        if (weighted)
+            for (i = 0; i < cnt; i++) stored += (UV)rsv_add_weighted_locked(h, ps[i], (uint64_t)ls[i], ws[i]);
+        else
+            for (i = 0; i < cnt; i++) stored += (UV)rsv_add_locked(h, ps[i], (uint64_t)ls[i]);
         __atomic_fetch_add(&h->hdr->stat_ops, 1, __ATOMIC_RELAXED);
         rsv_rwlock_wrunlock(h);
     }
@@ -254,6 +324,16 @@ item_size(self)
   OUTPUT:
     RETVAL
 
+int
+is_weighted(self)
+    SV *self
+  PREINIT:
+    EXTRACT(self);
+  CODE:
+    RETVAL = (h->mode == RSV_MODE_WEIGHTED) ? 1 : 0;   /* cached mode, no lock */
+  OUTPUT:
+    RETVAL
+
 SV *
 stats(self)
     SV *self
@@ -278,6 +358,7 @@ stats(self)
         hv_stores(hv, "seen",      newSVuv((UV)seen));
         hv_stores(hv, "ops",       newSVuv((UV)ops));
         hv_stores(hv, "mmap_size", newSVuv((UV)mmap_size));
+        hv_stores(hv, "weighted",  newSViv(h->mode == RSV_MODE_WEIGHTED ? 1 : 0));
         RETVAL = newRV_noinc((SV *)hv);
     }
   OUTPUT:

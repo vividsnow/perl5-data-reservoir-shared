@@ -9,7 +9,12 @@
  * A write-preferring futex rwlock with reader-slot dead-process recovery guards
  * mutation.  Items are stored inline, truncated to item_size bytes.
  *
- * Layout: Header -> reader_slots[1024] -> slots[k * (8 + item_size)]
+ * A reservoir may instead be created in WEIGHTED mode (Efraimidis-Spirakis
+ * A-Res): each item carries a weight and is kept with probability proportional
+ * to it, via a shared min-heap keyed by u^(1/weight) over the same items region.
+ *
+ * Layout (uniform):  Header -> reader_slots[1024] -> items[k * (8 + item_size)]
+ * Layout (weighted): Header -> reader_slots[1024] -> heap[k * 16] -> items[...]
  */
 
 #ifndef RSV_H
@@ -53,6 +58,9 @@
 #define RSV_MIN_ITEM     1
 #define RSV_MAX_ITEM     0x10000ULL      /* 64 KiB max bytes per stored item */
 
+#define RSV_MODE_UNIFORM  0U             /* Algorithm R: uniform sample of the stream */
+#define RSV_MODE_WEIGHTED 1U             /* Efraimidis-Spirakis A-Res: weighted sample */
+
 #define RSV_ERR(fmt, ...) do { if (errbuf) snprintf(errbuf, RSV_ERR_BUFLEN, fmt, ##__VA_ARGS__); } while (0)
 
 /* ================================================================
@@ -73,7 +81,7 @@ typedef struct {
 
 struct RsvHeader {
     uint32_t magic, version;          /* 0,4 */
-    uint32_t _pad0;                   /* 8 */
+    uint32_t mode;                    /* 8   RSV_MODE_UNIFORM | RSV_MODE_WEIGHTED */
     uint32_t _pad1;                   /* 12 */
     uint64_t k;                       /* 16  reservoir capacity (number of slots) */
     uint64_t item_size;               /* 24  max bytes stored per item */
@@ -89,11 +97,18 @@ struct RsvHeader {
     uint64_t stat_ops;                /* 88 */
     uint64_t seen;                    /* 96  total items observed (mutable, under wrlock) */
     uint64_t rng_state;               /* 104 xorshift64 RNG state (mutable, under wrlock) */
-    uint8_t  _pad[144];               /* 112..255 */
+    uint64_t heap_off;                /* 112 weighted A-Res min-heap region (0 in uniform mode) */
+    uint8_t  _pad[136];               /* 120..255 */
 };
 typedef struct RsvHeader RsvHeader;
 
 _Static_assert(sizeof(RsvHeader) == 256, "RsvHeader must be 256 bytes");
+
+/* Weighted (A-Res) min-heap entry: `key` = u^(1/weight), the smallest at the
+ * root so a heavier arrival can evict it.  `item` indexes the items region (a
+ * fixed cell that stays put -- only these 16-byte entries move during sift). */
+typedef struct { double key; uint64_t item; } RsvHeapEnt;
+_Static_assert(sizeof(RsvHeapEnt) == 16, "RsvHeapEnt must be 16 bytes");
 
 /* ---- Process-local handle ---- */
 
@@ -105,6 +120,8 @@ typedef struct RsvHandle {
     uint64_t      k;           /* reservoir size (cached) */
     uint64_t      item_size;   /* max bytes per item (cached) */
     uint64_t      stride;      /* per-slot byte stride (cached) */
+    uint32_t      mode;        /* RSV_MODE_* sampling mode (cached from validated header) */
+    uint64_t      heap_off;    /* weighted min-heap region offset (cached), 0 if uniform */
     size_t        mmap_size;
     char         *path;          /* backing file path (strdup'd) */
     int           backing_fd;    /* memfd or reopened-fd to close on destroy, -1 for file/anon */
@@ -536,12 +553,26 @@ static inline uint64_t rsv_stride(uint64_t item_size) {
     return (8 + item_size + 7) & ~(uint64_t)7;
 }
 
-static inline uint64_t rsv_total_size(uint64_t k, uint64_t item_size) {
+/* Weighted mode inserts a k-entry min-heap between the reader slots and the
+ * items region; uniform mode has no heap.  These are the single source of truth
+ * for the region offsets, used by both init and validate (never trust a stored
+ * derived field -- always re-derive from k + mode). */
+static inline uint64_t rsv_heap_region_off(uint32_t mode) {
+    return (mode == RSV_MODE_WEIGHTED) ? rsv_layout().slots : 0;
+}
+static inline uint64_t rsv_items_off(uint64_t k, uint32_t mode) {
     RsvLayout L = rsv_layout();
-    return L.slots + k * rsv_stride(item_size);
+    if (mode == RSV_MODE_WEIGHTED) {
+        uint64_t after_heap = L.slots + k * sizeof(RsvHeapEnt);
+        return (after_heap + 7) & ~(uint64_t)7;   /* 8-align the items array */
+    }
+    return L.slots;
+}
+static inline uint64_t rsv_total_size(uint64_t k, uint64_t item_size, uint32_t mode) {
+    return rsv_items_off(k, mode) + k * rsv_stride(item_size);
 }
 
-static inline void rsv_init_header(void *base, uint64_t k, uint64_t item_size, uint64_t total) {
+static inline void rsv_init_header(void *base, uint64_t k, uint64_t item_size, uint32_t mode, uint64_t total) {
     RsvLayout L = rsv_layout();
     RsvHeader *hdr = (RsvHeader *)base;
     /* Zero the header + reader-slot region (lock-recovery state); the slots array
@@ -549,13 +580,15 @@ static inline void rsv_init_header(void *base, uint64_t k, uint64_t item_size, u
     memset(base, 0, (size_t)L.slots);
     hdr->magic            = RSV_MAGIC;
     hdr->version          = RSV_VERSION;
+    hdr->mode             = mode;
     hdr->k                = k;
     hdr->item_size        = item_size;
     hdr->capacity         = k;
     hdr->stride           = rsv_stride(item_size);
     hdr->total_size       = total;
     hdr->reader_slots_off = L.reader_slots;
-    hdr->slots_off        = L.slots;
+    hdr->heap_off         = rsv_heap_region_off(mode);
+    hdr->slots_off        = rsv_items_off(k, mode);
     hdr->seen             = 0;
     /* seed the shared RNG from process + monotonic-clock entropy (never zero) */
     {
@@ -601,6 +634,8 @@ static inline RsvHandle *rsv_setup(void *base, size_t map_size,
     h->k            = hdr->k;
     h->item_size    = hdr->item_size;
     h->stride       = hdr->stride;
+    h->mode         = hdr->mode;
+    h->heap_off     = hdr->heap_off;
     h->mmap_size    = map_size;
     /* Layer B: if the mapping cannot even hold k slots the header lied about its
        size; clamp k to what actually fits (stride is validated 8+item_size). */
@@ -618,24 +653,27 @@ static inline RsvHandle *rsv_setup(void *base, size_t map_size,
 static inline int rsv_validate_header(const RsvHeader *hdr, uint64_t file_size) {
     if (hdr->magic != RSV_MAGIC) return 0;
     if (hdr->version != RSV_VERSION) return 0;
+    if (hdr->mode != RSV_MODE_UNIFORM && hdr->mode != RSV_MODE_WEIGHTED) return 0;
     if (hdr->k < RSV_MIN_K || hdr->k > RSV_MAX_K) return 0;
     if (hdr->item_size < RSV_MIN_ITEM || hdr->item_size > RSV_MAX_ITEM) return 0;
     if (hdr->capacity != hdr->k) return 0;
     if (hdr->stride != rsv_stride(hdr->item_size)) return 0;
+    if (hdr->heap_off != rsv_heap_region_off(hdr->mode)) return 0;
+    if (hdr->slots_off != rsv_items_off(hdr->k, hdr->mode)) return 0;
     if (hdr->total_size != file_size) return 0;
-    if (hdr->total_size != rsv_total_size(hdr->k, hdr->item_size)) return 0;
+    if (hdr->total_size != rsv_total_size(hdr->k, hdr->item_size, hdr->mode)) return 0;
     RsvLayout L = rsv_layout();
     if (hdr->reader_slots_off != L.reader_slots) return 0;
-    if (hdr->slots_off != L.slots) return 0;
     return 1;
 }
 
 /* validate constructor args (k reservoir size, item_size max bytes per item) */
-static int rsv_validate_args(uint64_t k, uint64_t item_size, char *errbuf) {
+static int rsv_validate_args(uint64_t k, uint64_t item_size, uint32_t mode, char *errbuf) {
     if (errbuf) errbuf[0] = '\0';
     if (k < RSV_MIN_K || k > RSV_MAX_K) { RSV_ERR("reservoir size must be between 1 and 2^30"); return 0; }
     if (item_size < RSV_MIN_ITEM || item_size > RSV_MAX_ITEM) { RSV_ERR("item_size must be between 1 and 65536"); return 0; }
-    if (rsv_stride(item_size) > (UINT64_MAX / 2) / k) { RSV_ERR("reservoir_size * item_size too large"); return 0; }
+    if (rsv_stride(item_size) > (UINT64_MAX / 4) / k) { RSV_ERR("reservoir_size * item_size too large"); return 0; }
+    if (mode == RSV_MODE_WEIGHTED && sizeof(RsvHeapEnt) > (UINT64_MAX / 4) / k) { RSV_ERR("reservoir_size too large for the weighted heap"); return 0; }
     return 1;
 }
 
@@ -661,10 +699,10 @@ static int rsv_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
-static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, mode_t mode, char *errbuf) {
-    if (!rsv_validate_args(k, item_size, errbuf)) return NULL;
+static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, uint32_t weighted, mode_t mode, char *errbuf) {
+    if (!rsv_validate_args(k, item_size, weighted, errbuf)) return NULL;
 
-    uint64_t total = rsv_total_size(k, item_size);
+    uint64_t total = rsv_total_size(k, item_size, weighted);
     int anonymous = (path == NULL);
     int fd = -1;
     size_t map_size;
@@ -699,15 +737,15 @@ static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, m
             return rsv_setup(base, map_size, path, -1);
         }
     }
-    rsv_init_header(base, k, item_size, total);
+    rsv_init_header(base, k, item_size, weighted, total);
     if (fd >= 0) { flock(fd, LOCK_UN); close(fd); }
     return rsv_setup(base, map_size, path, -1);
 }
 
-static RsvHandle *rsv_create_memfd(const char *name, uint64_t k, uint64_t item_size, char *errbuf) {
-    if (!rsv_validate_args(k, item_size, errbuf)) return NULL;
+static RsvHandle *rsv_create_memfd(const char *name, uint64_t k, uint64_t item_size, uint32_t weighted, char *errbuf) {
+    if (!rsv_validate_args(k, item_size, weighted, errbuf)) return NULL;
 
-    uint64_t total = rsv_total_size(k, item_size);
+    uint64_t total = rsv_total_size(k, item_size, weighted);
     int fd = memfd_create(name ? name : "reservoir", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (fd < 0) { RSV_ERR("memfd_create: %s", strerror(errno)); return NULL; }
     if (ftruncate(fd, (off_t)total) < 0) {
@@ -716,7 +754,7 @@ static RsvHandle *rsv_create_memfd(const char *name, uint64_t k, uint64_t item_s
     (void)fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW);
     void *base = mmap(NULL, (size_t)total, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { RSV_ERR("mmap: %s", strerror(errno)); close(fd); return NULL; }
-    rsv_init_header(base, k, item_size, total);
+    rsv_init_header(base, k, item_size, weighted, total);
     return rsv_setup(base, (size_t)total, NULL, fd);
 }
 
@@ -810,6 +848,73 @@ static int rsv_add_locked(RsvHandle *h, const void *item, uint64_t len) {
     }
     rsv_store(h, idx, item, len);
     return 1;
+}
+
+/* ---- weighted (A-Res) min-heap over the items region (weighted mode only) ----
+ * One 16-byte {key,item} entry per kept item; entry.item indexes a fixed items
+ * cell that stays put -- sifting moves only these entries, never the item bytes. */
+static inline RsvHeapEnt *rsv_heap(RsvHandle *h) {
+    return (RsvHeapEnt *)((char *)h->base + h->heap_off);
+}
+/* Layer B trusted bound: heap entries guaranteed within the real mapping. */
+static inline uint64_t rsv_heap_max(RsvHandle *h) {
+    uint64_t off = h->heap_off;
+    if (off == 0 || off >= h->mmap_size) return 0;
+    return (h->mmap_size - off) / sizeof(RsvHeapEnt);
+}
+static inline void rsv_heap_swap(RsvHeapEnt *hp, uint64_t a, uint64_t b) {
+    RsvHeapEnt t = hp[a]; hp[a] = hp[b]; hp[b] = t;
+}
+static inline void rsv_heap_sift_up(RsvHeapEnt *hp, uint64_t i) {
+    while (i > 0) {
+        uint64_t p = (i - 1) / 2;
+        if (hp[i].key < hp[p].key) { rsv_heap_swap(hp, i, p); i = p; } else break;
+    }
+}
+static inline void rsv_heap_sift_down(RsvHeapEnt *hp, uint64_t i, uint64_t size) {
+    for (;;) {
+        uint64_t l = 2*i + 1, r = 2*i + 2, m = i;
+        if (l < size && hp[l].key < hp[m].key) m = l;
+        if (r < size && hp[r].key < hp[m].key) m = r;
+        if (m == i) break;
+        rsv_heap_swap(hp, i, m); i = m;
+    }
+}
+
+/* observe one weighted item.  A-Res: assign it key = u^(1/weight), u ~ U(0,1];
+ * keep the k items with the largest keys via a min-heap (root = smallest kept
+ * key).  Returns 1 if kept, 0 if discarded.  `weight` is validated finite > 0 in
+ * XS before the lock.  Caller holds the write lock. */
+static int rsv_add_weighted_locked(RsvHandle *h, const void *item, uint64_t len, double weight) {
+    RsvHeader *hdr = h->hdr;
+    uint64_t k = h->k;                          /* cached geometry */
+    uint64_t smax = rsv_slots_max(h);
+    uint64_t hmax = rsv_heap_max(h);
+    if (k > smax) k = smax;
+    if (k > hmax) k = hmax;                     /* Layer B: never index past either region */
+    if (k == 0) return 0;
+    uint64_t x = rsv_rng_next(hdr);
+    double u = (double)((x >> 11) + 1) * (1.0 / 9007199254740992.0);   /* (0, 1] */
+    double key = pow(u, 1.0 / weight);
+    RsvHeapEnt *hp = rsv_heap(h);
+    uint64_t size = hdr->seen < k ? hdr->seen : k;   /* items currently kept */
+    if (size < k) {                             /* still filling: append + sift up */
+        rsv_store(h, size, item, len);
+        hp[size].key = key; hp[size].item = size;
+        rsv_heap_sift_up(hp, size);
+        hdr->seen++;
+        return 1;
+    }
+    hdr->seen++;                                /* full: this item was observed regardless */
+    if (key > hp[0].key) {                       /* heavier than the current minimum: evict it */
+        uint64_t cell = hp[0].item;
+        if (cell >= k) return 0;                /* Layer B: corrupt heap entry -> refuse */
+        rsv_store(h, cell, item, len);
+        hp[0].key = key;
+        rsv_heap_sift_down(hp, 0, k);
+        return 1;
+    }
+    return 0;                                    /* lighter: discard */
 }
 
 /* point *out_ptr/*out_len at slot i's item inside the mapping (caller holds the
