@@ -89,13 +89,31 @@ use Data::Reservoir::Shared;
     cmp_ok $light_rate, '<', 0.05, "light items rarely kept ($light_rate)";
 }
 
-# add_many with [item, weight] pairs matches a loop of add()
+# add_many with [item, weight] pairs: basic bookkeeping
 {
     my $r = Data::Reservoir::Shared->new_weighted(undef, 4, 16);
     my $stored = $r->add_many([ map { ["v$_", $_ + 1] } 1 .. 10 ]);
     cmp_ok $stored, '>=', 4, 'add_many stored at least k';
     is $r->count, 4, 'add_many: count is k';
     is $r->seen, 10, 'add_many: seen counts all pairs';
+}
+
+# add_many actually plumbs each pair's weight (not silently treating them as 1):
+# same A(w=1) vs B(w=3) -> P(B) ~ 3/4 oracle as the k=1 add() test, but fed through
+# add_many.  If weights were misread as 1, P(B) would collapse to ~1/2 and fail.
+{
+    my $z = Data::Reservoir::Shared->new_weighted(undef, 1, 8);
+    $z->seed(2654435761);
+    my ($b, $N) = (0, 8000);
+    for (1 .. $N) {
+        $z->clear;
+        $z->add_many([ ["A", 1], ["B", 3] ]);
+        my @s = $z->sample;
+        $b++ if @s == 1 && $s[0] eq "B";
+    }
+    my $p = $b / $N;
+    cmp_ok $p, '>=', 0.72, "add_many k=1: P(B|w=3) >= 0.72 (got $p)";
+    cmp_ok $p, '<=', 0.78, "add_many k=1: P(B|w=3) <= 0.78 (got $p)";
 }
 
 # error handling (all croak BEFORE taking the lock)

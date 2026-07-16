@@ -56,7 +56,8 @@ guards mutation.
 
 Items are stored B<inline>, truncated to C<item_size> bytes (default 256): an
 item longer than C<item_size> keeps only its first C<item_size> bytes. Memory is
-C<k * (8 + item_size)> bytes for the slots plus a fixed header. Items are handled
+about C<k * S> bytes for the slots, where the per-slot stride C<S> rounds
+C<8 + item_size> up to a multiple of 8, plus a fixed header. Items are handled
 by their B<byte> content; wide-character strings (any codepoint above 255) cause
 a "Wide character" croak -- encode to bytes first. B<Linux-only>. Requires 64-bit
 Perl.
@@ -111,9 +112,10 @@ C<add> feeds one item and returns B<1 if it is now stored> in the reservoir or
 B<0 if it was discarded>. On a B<weighted> reservoir C<add> takes a second
 argument, the item's weight (a finite number greater than zero -- a missing,
 zero, negative, infinite, or NaN weight croaks). C<add_many> feeds an array
-reference under a single write lock, returning how many of the batch are
-currently retained; for a weighted reservoir each element must be an
-C<< [$item, $weight] >> pair. C<sample> returns the retained items as a list
+reference under a single write lock, returning how many of the batch were
+stored (an item that replaces an earlier sample counts as stored; use
+C<count> for the number currently retained); for a weighted reservoir each
+element must be an C<< [$item, $weight] >> pair. C<sample> returns the retained items as a list
 (order is not meaningful); C<get> returns a single retained item by index.
 C<clear> empties the reservoir and resets the seen counter.
 
@@ -162,6 +164,18 @@ Mutation is guarded by a futex-based write-preferring rwlock with PID-encoded
 ownership and dead-owner recovery. Each C<add> is a short bounded update, so a
 crash leaves the reservoir consistent up to the last completed operation.
 B<Limitation>: PID reuse is not detected (very unlikely in practice).
+
+Reader-slot exhaustion (slotless readers): dead-process recovery attributes a
+crashed lock holder's contribution through its reader-slot. The slot table holds
+1024 entries (one per concurrent reader process). If more than that many reader
+processes share one mapping at once, a reader that cannot claim a slot proceeds
+"slotless" -- it still takes the read lock but leaves no per-process record. If
+such a slotless reader is then killed while holding the read lock, its share of
+the lock cannot be attributed to a dead process, so writer recovery cannot
+reclaim it and writers may block until the mapping is recreated. Reaching this
+needs more than 1024 concurrent reader processes on one mapping plus a crash in
+the brief read-lock window; the dead-process slot reclaim keeps the table from
+filling with stale entries, so in practice it is very unlikely.
 
 =head1 SEE ALSO
 

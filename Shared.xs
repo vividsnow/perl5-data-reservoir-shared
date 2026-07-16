@@ -9,7 +9,8 @@
     if (!sv_isobject(sv) || !sv_derived_from(sv, "Data::Reservoir::Shared")) \
         croak("Expected a Data::Reservoir::Shared object"); \
     RsvHandle *h = INT2PTR(RsvHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Attempted to use a destroyed Data::Reservoir::Shared object")
+    if (!h) croak("Attempted to use a destroyed Data::Reservoir::Shared object"); \
+    sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
@@ -22,18 +23,22 @@ MODULE = Data::Reservoir::Shared  PACKAGE = Data::Reservoir::Shared
 PROTOTYPES: DISABLE
 
 SV *
-new(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
+new(class, path = &PL_sv_undef, ...)
     const char *class
     SV *path
-    UV k
-    UV item_size
   PREINIT:
     char errbuf[RSV_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    /* k / item_size read here (not as typemap params) so an explicit undef falls
+     * through to the default instead of warning "uninitialized value". */
+    UV k = (items > 2 && (SvGETMAGIC(ST(2)), SvOK(ST(2)))) ? SvUV(ST(2)) : 0;
+    UV item_size = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? SvUV(ST(3)) : 256;
     if (k < 1) croak("Data::Reservoir::Shared->new: reservoir size (k) must be >= 1");
-    /* Optional 5th arg: file mode for a newly-created file-backed segment. */
+    /* Optional 5th arg: file mode for a newly-created file-backed segment.
+     * Resolve its magic (tied/overloaded) BEFORE capturing path's PV: a FETCH
+     * here could realloc/free path's buffer, dangling p before rsv_create. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, mode, errbuf);
     if (!hh) croak("Data::Reservoir::Shared->new: %s", errbuf);
     MAKE_OBJ(class, hh);
@@ -41,14 +46,16 @@ new(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
     RETVAL
 
 SV *
-new_memfd(class, name = &PL_sv_undef, k = 0, item_size = 256)
+new_memfd(class, name = &PL_sv_undef, ...)
     const char *class
     SV *name
-    UV k
-    UV item_size
   PREINIT:
     char errbuf[RSV_ERR_BUFLEN];
   CODE:
+    /* k / item_size read here (not as typemap params) so an explicit undef falls
+     * through to the default instead of warning "uninitialized value". */
+    UV k = (items > 2 && (SvGETMAGIC(ST(2)), SvOK(ST(2)))) ? SvUV(ST(2)) : 0;
+    UV item_size = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? SvUV(ST(3)) : 256;
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
     if (k < 1) croak("Data::Reservoir::Shared->new_memfd: reservoir size (k) must be >= 1");
     RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, errbuf);
@@ -58,18 +65,22 @@ new_memfd(class, name = &PL_sv_undef, k = 0, item_size = 256)
     RETVAL
 
 SV *
-new_weighted(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
+new_weighted(class, path = &PL_sv_undef, ...)
     const char *class
     SV *path
-    UV k
-    UV item_size
   PREINIT:
     char errbuf[RSV_ERR_BUFLEN];
   CODE:
-    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
+    /* k / item_size read here (not as typemap params) so an explicit undef falls
+     * through to the default instead of warning "uninitialized value". */
+    UV k = (items > 2 && (SvGETMAGIC(ST(2)), SvOK(ST(2)))) ? SvUV(ST(2)) : 0;
+    UV item_size = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? SvUV(ST(3)) : 256;
     if (k < 1) croak("Data::Reservoir::Shared->new_weighted: reservoir size (k) must be >= 1");
-    /* Optional 5th arg: file mode for a newly-created file-backed segment. */
+    /* Optional 5th arg: file mode for a newly-created file-backed segment.
+     * Resolve its magic (tied/overloaded) BEFORE capturing path's PV: a FETCH
+     * here could realloc/free path's buffer, dangling p before rsv_create. */
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
+    const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, RSV_MODE_WEIGHTED, mode, errbuf);
     if (!hh) croak("Data::Reservoir::Shared->new_weighted: %s", errbuf);
     MAKE_OBJ(class, hh);
@@ -77,14 +88,16 @@ new_weighted(class, path = &PL_sv_undef, k = 0, item_size = 256, ...)
     RETVAL
 
 SV *
-new_weighted_memfd(class, name = &PL_sv_undef, k = 0, item_size = 256)
+new_weighted_memfd(class, name = &PL_sv_undef, ...)
     const char *class
     SV *name
-    UV k
-    UV item_size
   PREINIT:
     char errbuf[RSV_ERR_BUFLEN];
   CODE:
+    /* k / item_size read here (not as typemap params) so an explicit undef falls
+     * through to the default instead of warning "uninitialized value". */
+    UV k = (items > 2 && (SvGETMAGIC(ST(2)), SvOK(ST(2)))) ? SvUV(ST(2)) : 0;
+    UV item_size = (items > 3 && (SvGETMAGIC(ST(3)), SvOK(ST(3)))) ? SvUV(ST(3)) : 256;
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
     if (k < 1) croak("Data::Reservoir::Shared->new_weighted_memfd: reservoir size (k) must be >= 1");
     RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, RSV_MODE_WEIGHTED, errbuf);
@@ -126,15 +139,19 @@ add(self, item, weight = &PL_sv_undef)
     const char *s;
     double w = 0;
   CODE:
-    s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock */
     if (h->mode == RSV_MODE_WEIGHTED) {
-        /* resolve + validate the weight BEFORE taking the lock (no croak under lock) */
+        /* Resolve + validate the weight BEFORE capturing the item PV. SvNV(weight)
+         * can run the weight's numeric overload/tie = arbitrary Perl that may
+         * realloc or free the item SV, dangling a PV captured earlier. Do all the
+         * weight magic first, THEN grab the item bytes so nothing runs between the
+         * SvPVbyte and its use. (Also keeps any croak out from under the lock.) */
         if (!(SvGETMAGIC(weight), SvOK(weight)))
             croak("Data::Reservoir::Shared: weighted add(item, weight) requires a weight");
         w = SvNV(weight);
         if (!(w > 0.0) || !isfinite(w))
             croak("Data::Reservoir::Shared: weight must be a finite number > 0");
     }
+    s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock, AFTER weight magic */
     rsv_rwlock_wrlock(h);
     RETVAL = (h->mode == RSV_MODE_WEIGHTED)
         ? rsv_add_weighted_locked(h, s, (uint64_t)n, w)
@@ -154,9 +171,13 @@ add_many(self, items)
     IV  top;
     UV  stored = 0;
   CODE:
+    SvGETMAGIC(items);
     if (!SvROK(items) || SvTYPE(SvRV(items)) != SVt_PVAV)
         croak("Data::Reservoir::Shared->add_many: expected an array reference");
     av = (AV *)SvRV(items);
+    /* Pin the array for the whole loop: an element's magic can drop the caller's
+     * last reference (undef $aref), freeing av and dangling later av_fetch calls. */
+    SvREFCNT_inc((SV *)av); sv_2mortal((SV *)av);
     top = av_len(av);
     {
         STRLEN cnt = (top >= 0) ? (STRLEN)(top + 1) : 0, i;
@@ -171,6 +192,7 @@ add_many(self, items)
                 if (weighted) {
                     /* weighted mode: each element is a [item, weight] pair,
                      * validated here (before the lock; no croak while locked) */
+                    if (el && *el) SvGETMAGIC(*el);   /* a tied-array element is a deferred-magic PVLV */
                     if (!el || !*el || !SvROK(*el) || SvTYPE(SvRV(*el)) != SVt_PVAV)
                         croak("Data::Reservoir::Shared->add_many: weighted reservoir expects [item, weight] pairs");
                     AV *pair = (AV *)SvRV(*el);
@@ -178,14 +200,35 @@ add_many(self, items)
                     SV **wv = av_fetch(pair, 1, 0);
                     if (!iv || !*iv || !wv || !*wv)
                         croak("Data::Reservoir::Shared->add_many: each element must be [item, weight]");
-                    ps[i] = SvPVbyte(*iv, ls[i]);
-                    SvGETMAGIC(*wv);
-                    { double w = SvNV(*wv);
+                    /* Pin both element SVs by value BEFORE any magic runs: the item's
+                     * SvPVbyte (or the weight's get-magic) can free or reassign the
+                     * pair AV, dangling the other's raw SV** slot. The mortal INC
+                     * keeps both alive for this branch even if the pair AV is freed. */
+                    SV *isv = *iv, *wsv = *wv;
+                    SvREFCNT_inc(isv); sv_2mortal(isv);
+                    SvREFCNT_inc(wsv); sv_2mortal(wsv);
+                    {
+                        STRLEN len;
+                        const char *src = SvPVbyte(isv, len); /* may run overload/tie/get-magic = arbitrary Perl */
+                        /* Copy bytes into a private mortal SV NOW: a LATER element SvPVbyte can
+                         * grow/free THIS element PV, dangling src before the locked loop uses it. */
+                        SV *copy = sv_2mortal(newSVpvn(src, len));
+                        ps[i] = SvPVX_const(copy);
+                        ls[i] = len;
+                    }
+                    SvGETMAGIC(wsv);
+                    { double w = SvOK(wsv) ? SvNV(wsv) : 0.0;  /* undef -> 0 -> clean croak below, no warning */
                       if (!(w > 0.0) || !isfinite(w))
                           croak("Data::Reservoir::Shared->add_many: weight must be a finite number > 0");
                       ws[i] = w; }
                 } else if (el && *el) {
-                    ps[i] = SvPVbyte(*el, ls[i]);
+                    STRLEN len;
+                    const char *src = SvPVbyte(*el, len); /* may run overload/tie/get-magic = arbitrary Perl */
+                    /* Copy bytes into a private mortal SV NOW: a LATER element SvPVbyte can
+                     * grow/free THIS element PV, dangling src before the locked loop uses it. */
+                    SV *copy = sv_2mortal(newSVpvn(src, len));
+                    ps[i] = SvPVX_const(copy);
+                    ls[i] = len;
                 } else { ps[i] = ""; ls[i] = 0; }
             }
         }

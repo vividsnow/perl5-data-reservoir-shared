@@ -1,8 +1,8 @@
 Revision history for Data-Reservoir-Shared
 
-0.02      2026-07-11
-          - Add weighted (Efraimidis-Spirakis A-Res) sampling: new_weighted,
-            new_weighted_memfd, add(item, weight), and weighted add_many.
+0.02      2026-07-21
+          - Add weighted (A-Res) sampling: new_weighted / add(item, weight).
+          - Pin both elements of a weighted pair before reading either.
 
 0.01      2026-07-10
           - Initial release. Shared-memory reservoir sampler: a uniform random
