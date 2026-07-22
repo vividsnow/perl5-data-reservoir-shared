@@ -12,6 +12,19 @@
     if (!h) croak("Attempted to use a destroyed Data::Reservoir::Shared object"); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
+/* The pin above only blocks REFCOUNT-driven destruction. Perl run from argument
+ * magic can still call $obj->DESTROY explicitly, which frees the handle and
+ * zeroes the IV, leaving the local `h` dangling. Re-read it wherever such magic
+ * can intervene before `h` is used: SvGETMAGIC on an argument, av_len on a TIED
+ * array (AvFILL -> mg_size -> FETCHSIZE), and element fetches.
+ * The same Perl can also REPLACE the invocant ($obj = 42 mutates ST(0), because
+ * Perl passes aliases), hence the SvROK re-check before SvRV. */
+#define REEXTRACT(sv) \
+    if (!SvROK(sv)) \
+        croak("Data::Reservoir::Shared object was replaced during the call"); \
+    h = INT2PTR(RsvHandle*, SvIV(SvRV(sv))); \
+    if (!h) croak("Data::Reservoir::Shared object destroyed during the call")
+
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
     SV *ref = newRV_noinc(obj); \
@@ -179,6 +192,9 @@ add_many(self, items)
      * last reference (undef $aref), freeing av and dangling later av_fetch calls. */
     SvREFCNT_inc((SV *)av); sv_2mortal((SV *)av);
     top = av_len(av);
+    /* SvGETMAGIC(items) above, and av_len on a tied array, both run Perl that
+     * can have destroyed self -- re-check before the first use of h below. */
+    REEXTRACT(self);
     {
         STRLEN cnt = (top >= 0) ? (STRLEN)(top + 1) : 0, i;
         const char **ps = NULL; STRLEN *ls = NULL; double *ws = NULL;
@@ -232,6 +248,11 @@ add_many(self, items)
                 } else { ps[i] = ""; ls[i] = 0; }
             }
         }
+        /* Element get-magic in the resolve loop above (SvPVbyte / SvGETMAGIC on
+         * the weight) can also have destroyed self. Outside the `if (cnt)`
+         * block: an empty or tied size-0 array skips the loop but still
+         * reaches this lock. */
+        REEXTRACT(self);
         rsv_rwlock_wrlock(h);
         if (weighted)
             for (i = 0; i < cnt; i++) stored += (UV)rsv_add_weighted_locked(h, ps[i], (uint64_t)ls[i], ws[i]);
