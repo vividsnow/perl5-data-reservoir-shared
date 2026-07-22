@@ -1,6 +1,10 @@
 Revision history for Data-Reservoir-Shared
 
-0.02      2026-07-21
+0.02      2026-07-22
+          - Fix a use-after-free in add_many(): a tied array, or overloaded
+            or tied elements, run Perl that can destroy the reservoir, after
+            which the already-captured handle was still used. Such a call
+            now croaks.
           - Add weighted (A-Res) sampling: new_weighted / add(item, weight).
           - Pin both elements of a weighted pair before reading either.
 
