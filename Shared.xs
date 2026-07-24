@@ -165,6 +165,9 @@ add(self, item, weight = &PL_sv_undef)
             croak("Data::Reservoir::Shared: weight must be a finite number > 0");
     }
     s = SvPVbyte(item, n);                 /* may croak (wide char) -- BEFORE the lock, AFTER weight magic */
+    /* SvNV(weight) above and SvPVbyte(item) just now both run magic = arbitrary
+     * Perl that can have destroyed self -- re-check before the first use of h. */
+    REEXTRACT(self);
     rsv_rwlock_wrlock(h);
     RETVAL = (h->mode == RSV_MODE_WEIGHTED)
         ? rsv_add_weighted_locked(h, s, (uint64_t)n, w)
