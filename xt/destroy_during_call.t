@@ -55,10 +55,14 @@ my @cases = (
       sub { my $e = bless [$victim], 'Evil::Replace'; $victim->add_many([$e, 'b', 'c']) } ],
     [ 'tied FETCHSIZE destroys (empty array skips the element loop)', $destroyed,
       sub { tie my @a, 'Tied::Empty', $victim; $victim->add_many(\@a) } ],
+    [ 'item magic destroys', $destroyed,
+      sub { my $e = bless [$victim], 'Evil::Destroy'; $victim->add($e) },
+      'add' ],
 );
 
 for my $case (@cases) {
-    my ($name, $want, $call) = @$case;
+    my ($name, $want, $call, $method) = @$case;
+    $method //= 'add_many';
     my $pid = fork();
     unless (defined $pid) { plan skip_all => "fork failed: $!" }
     unless ($pid) {
@@ -72,9 +76,9 @@ for my $case (@cases) {
     }
     waitpid($pid, 0);
     my $st = $?;
-    ok !($st & 127), "add_many: no crash when $name"
+    ok !($st & 127), "$method: no crash when $name"
         or diag sprintf('died with signal %d', $st & 127);
-    is $st >> 8, 0, "add_many: croaks instead of using the bad handle when $name";
+    is $st >> 8, 0, "$method: croaks instead of using the bad handle when $name";
 }
 
 done_testing;
