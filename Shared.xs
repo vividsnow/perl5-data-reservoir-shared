@@ -10,6 +10,7 @@
         croak("Expected a Data::Reservoir::Shared object"); \
     RsvHandle *h = INT2PTR(RsvHandle*, SvIV(SvRV(sv))); \
     if (!h) croak("Attempted to use a destroyed Data::Reservoir::Shared object"); \
+    RsvHandle *h0 = h; PERL_UNUSED_VAR(h0); \
     sv_2mortal(SvREFCNT_inc(SvRV(sv)))
 
 /* The pin above only blocks REFCOUNT-driven destruction. Perl run from argument
@@ -23,7 +24,7 @@
     if (!SvROK(sv)) \
         croak("Data::Reservoir::Shared object was replaced during the call"); \
     h = INT2PTR(RsvHandle*, SvIV(SvRV(sv))); \
-    if (!h) croak("Data::Reservoir::Shared object destroyed during the call")
+    if (h != h0) croak("Data::Reservoir::Shared object replaced or destroyed during the call")
 
 #define MAKE_OBJ(class, handle) \
     SV *obj = newSViv(PTR2IV(handle)); \
