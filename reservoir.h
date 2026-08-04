@@ -556,7 +556,6 @@ static inline void rsv_init_header(void *base, uint64_t k, uint64_t item_size, u
     /* Zero the header + reader-slot region (lock-recovery state); the slots array
        relies on the fresh mapping being OS zero-filled (all lengths 0 = empty). */
     memset(base, 0, (size_t)L.slots);
-    hdr->magic            = RSV_MAGIC;
     hdr->version          = RSV_VERSION;
     hdr->mode             = mode;
     hdr->k                = k;
@@ -575,6 +574,11 @@ static inline void rsv_init_header(void *base, uint64_t k, uint64_t item_size, u
         s ^= 0x9E3779B97F4A7C15ULL;
         hdr->rng_state = s ? s : 0x9E3779B97F4A7C15ULL;
     }
+    /* Publish magic LAST, as a release store: it is the commit point, so a
+       creator killed before this store leaves magic==0 -- which the
+       crashed-creator recovery treats as an abandoned mid-init file and
+       recovers, instead of a magic-set-but-incomplete header that would brick. */
+    __atomic_store_n(&hdr->magic, RSV_MAGIC, __ATOMIC_RELEASE);
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
@@ -678,6 +682,16 @@ static int rsv_secure_open(const char *path, mode_t mode, char *errbuf) {
     return -1;
 }
 
+/* True iff the whole mapped region is zero. A freshly ftruncate'd file (the only
+   thing an abandoned mid-init creator leaves) reads as all zeros, so this lets the
+   recovery re-init ONLY a provably-empty file and never a same-owner file that
+   merely starts with a zero word. Recovery is a cold path, so a byte scan is fine. */
+static inline int rsv_region_is_zero(const void *p, size_t n) {
+    const unsigned char *b = (const unsigned char *)p;
+    for (size_t i = 0; i < n; i++) if (b[i]) return 0;
+    return 1;
+}
+
 static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, uint32_t weighted, mode_t mode, char *errbuf) {
     if (!rsv_validate_args(k, item_size, weighted, errbuf)) return NULL;
 
@@ -721,7 +735,7 @@ static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, u
                  * size, still uninitialized (magic==0), and owned by us -- a valid
                  * or foreign file fails this and still errors, never clobbered. */
                 if (((RsvHeader *)base)->magic == 0 && (uint64_t)st.st_size == total
-                    && st.st_uid == geteuid()) {
+                    && st.st_uid == geteuid() && rsv_region_is_zero(base, map_size)) {
                     if (fchmod(fd, mode) < 0) {
                         RSV_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;

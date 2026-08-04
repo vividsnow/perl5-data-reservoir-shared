@@ -54,7 +54,7 @@ new(class, path = &PL_sv_undef, ...)
     mode_t mode = (items > 4 && (SvGETMAGIC(ST(4)), SvOK(ST(4)))) ? (mode_t)SvUV(ST(4)) : 0600;
     const char *p = (SvGETMAGIC(path), SvOK(path)) ? SvPV_nolen(path) : NULL;
     RsvHandle *hh = rsv_create(p, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, mode, errbuf);
-    if (!hh) croak("Data::Reservoir::Shared->new: %s", errbuf);
+    if (!hh) croak("Data::Reservoir::Shared->new: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -73,7 +73,7 @@ new_memfd(class, name = &PL_sv_undef, ...)
     const char *nm = (SvGETMAGIC(name), SvOK(name)) ? SvPV_nolen(name) : NULL;
     if (k < 1) croak("Data::Reservoir::Shared->new_memfd: reservoir size (k) must be >= 1");
     RsvHandle *hh = rsv_create_memfd(nm, (uint64_t)k, (uint64_t)item_size, RSV_MODE_UNIFORM, errbuf);
-    if (!hh) croak("Data::Reservoir::Shared->new_memfd: %s", errbuf);
+    if (!hh) croak("Data::Reservoir::Shared->new_memfd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
@@ -128,7 +128,7 @@ new_from_fd(class, fd)
     char errbuf[RSV_ERR_BUFLEN];
   CODE:
     RsvHandle *hh = rsv_open_fd(fd, errbuf);
-    if (!hh) croak("Data::Reservoir::Shared->new_from_fd: %s", errbuf);
+    if (!hh) croak("Data::Reservoir::Shared->new_from_fd: %s", errbuf[0] ? errbuf : "out of memory");
     MAKE_OBJ(class, hh);
   OUTPUT:
     RETVAL
