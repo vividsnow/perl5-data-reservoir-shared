@@ -740,7 +740,6 @@ static RsvHandle *rsv_create(const char *path, uint64_t k, uint64_t item_size, u
                         RSV_ERR("%s: fchmod: %s", path, strerror(errno));
                         munmap(base, map_size); flock(fd, LOCK_UN); close(fd); return NULL;
                     }
-                    memset(base, 0, map_size);   /* start from a provably empty reservoir */
                     rsv_init_header(base, k, item_size, weighted, total);
                     flock(fd, LOCK_UN); close(fd);
                     return rsv_setup(base, map_size, path, -1);
