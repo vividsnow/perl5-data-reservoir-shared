@@ -18,6 +18,8 @@ xt/enospc.t
 xt/fork_rsv.t
 xt/kwalitee.t
 xt/pod.t
+xt/reserve.t
 xt/sift_kill.t
 xt/tsan.t
 xt/valgrind.t
+t/unlink-chdir.t
